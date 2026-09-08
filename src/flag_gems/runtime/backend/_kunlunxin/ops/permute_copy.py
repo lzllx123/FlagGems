@@ -5,6 +5,7 @@ import triton
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
+from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 
@@ -64,7 +65,12 @@ def permute_copy(x: torch.Tensor, dims):
     src = x.contiguous() if not x.is_contiguous() else x
     out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
-    # x.permute(dims) is a strided zero-copy view with shape == out_shape;
-    # pointwise_dynamic reads it (strided) and writes contiguous `out`.
-    _permute_copy_pw(src.permute(dims), out0=out)
+    # x.permute(dims) is a strided zero-copy view with shape == out_shape.
+    permuted = src.permute(dims)
+    # tle.gpu takes it either as a TMA tile (permutations that keep the
+    # innermost axis contiguous) or, for a real transpose, as an element-wise
+    # gather/scatter through LM.
+    if tle_copy(permuted, out):
+        return out
+    _permute_copy_pw(permuted, out0=out)
     return out

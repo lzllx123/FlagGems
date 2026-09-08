@@ -16,10 +16,8 @@ import logging
 from typing import Optional
 
 import torch
-import triton
 
-from ..utils.codegen_config_utils import CodeGenConfig
-from ..utils.pointwise_dynamic import pointwise_dynamic
+from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
@@ -27,34 +25,14 @@ _FALLBACK_KEYSET = torch._C.DispatchKeySet(
     torch._C.DispatchKey.CompositeExplicitAutograd
 )
 
-config_ = CodeGenConfig(
-    512,
-    (65536, 65536, 65536),
-    32,
-    True,
-    prefer_1d_tile=True,
-    is_scatter_slice=True,
-)
+_FLOAT8_E8M0FNU = getattr(torch, "float8_e8m0fnu", None)
 
-
-# @pointwise_dynamic(is_tensor=(True,), promotion_methods=[(0, "DEFAULT")])
-# @triton.jit
-# def copy(src):
-#     return src
-
-
-@pointwise_dynamic(
-    is_tensor=(True,), promotion_methods=[(0, "DEFAULT")], config=config_
-)
-@triton.jit
-def copy_slice(src):
-    return src
-
-
-@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")])
-@triton.jit
-def _copy_kernel(src):
-    return src
+# Below this element count a copy is dominated by host-side work, not by the
+# kernel: the functional wrapper costs an extra allocation plus a second python
+# dispatch through copy_, which measures ~47us on [64, 64] while the native op
+# does the whole copy in ~8us (benchmark/test_copy.py --level core, Gems Speedup
+# 0.16x). Anything this small goes straight back to PyTorch.
+_SMALL_COPY_NUMEL = 2**14
 
 
 def _can_use_triton(dst: torch.Tensor, src: torch.Tensor) -> bool:
@@ -65,9 +43,13 @@ def _can_use_triton(dst: torch.Tensor, src: torch.Tensor) -> bool:
     if dst.is_quantized or src.is_quantized:
         return False
     if src.is_complex() or dst.is_complex():
-        # Triton on kunlunxin does not support complex dtypes; fall back to PyTorch.
+        # Preserve PyTorch's behaviour of warning when casting complex to real
+        # by forcing the redispatch path, which issues the warning internally.
         return False
-    if not src.is_contiguous():
+    if _FLOAT8_E8M0FNU is not None and (
+        src.dtype == _FLOAT8_E8M0FNU or dst.dtype == _FLOAT8_E8M0FNU
+    ):
+        # Triton does not support float8 yet, so defer to PyTorch which has a reference implementation.
         return False
     return True
 
@@ -81,7 +63,7 @@ def _expand_like(src: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
 def copy(
     template: torch.Tensor, src: torch.Tensor, *, non_blocking: Optional[bool] = False
 ):
-    logger.debug("GEMS_KUNLUNXIN COPY")
+    logger.debug("GEMS COPY (functional)")
     out = torch.empty_strided(
         template.size(), template.stride(), dtype=template.dtype, device=template.device
     )
@@ -90,8 +72,21 @@ def copy(
 
 
 def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
-    if not isinstance(src, torch.Tensor):
-        raise TypeError("src must be a Tensor")
+    if isinstance(src, (int, float, bool)):
+        src = torch.tensor(src, device=dst.device)
+    elif not isinstance(src, torch.Tensor):
+        raise TypeError("unsupport src type for copy_: ", type(src))
+
+    # Small copies are host-bound: the checks below plus the kernel launch cost
+    # ~94us on [64, 64] while the native op moves the same data in ~8us. Native
+    # is also the semantic reference for zerotensors, aliasing and dtype
+    # conversion, so nothing is lost by handing these straight over. Broadcast is
+    # the one exception -- the native XPU copy_ only fills the first row of a
+    # broadcast source -- so equal shapes are required.
+    if dst.numel() < _SMALL_COPY_NUMEL and src.shape == dst.shape:
+        return torch.ops.aten.copy_.default.redispatch(
+            _FALLBACK_KEYSET, dst, src, non_blocking
+        )
 
     # this is the same as PyTorch's check
     if dst._is_zerotensor():
@@ -116,6 +111,18 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
             _FALLBACK_KEYSET, dst, src, non_blocking
         )
 
+    if _FLOAT8_E8M0FNU is not None and (
+        src.dtype == _FLOAT8_E8M0FNU or dst.dtype == _FLOAT8_E8M0FNU
+    ):
+        return torch.ops.aten.copy_.default.redispatch(
+            _FALLBACK_KEYSET, dst, src, non_blocking
+        )
+
+    if src.numel() > 2**31 - 1 or dst.numel() > 2**31 - 1:
+        return torch.ops.aten.copy_.default.redispatch(
+            _FALLBACK_KEYSET, dst, src, non_blocking
+        )
+
     if not _can_use_triton(dst, src):
         return torch.ops.aten.copy_.default.redispatch(
             _FALLBACK_KEYSET, dst, src, non_blocking
@@ -127,7 +134,7 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
             _FALLBACK_KEYSET, dst, src, non_blocking
         )
 
-    logger.debug("GEMS_KUNLUNXIN COPY_")
+    logger.debug("GEMS COPY_")
 
     try:
         broadcast_shape = torch.broadcast_shapes(dst.shape, src.shape)
@@ -141,6 +148,14 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
 
     expanded_src = _expand_like(src, dst.shape)
 
-    overload = _copy_kernel.instantiate(expanded_src.ndim)
-    overload(expanded_src, out0=dst)
-    return dst
+    # tle.gpu does the whole move: a TMA tile when the layout is affine, an
+    # element-wise gather/scatter for permuted or broadcast reads, and the same
+    # gather with an LM-side cast when src and dst differ in dtype.
+    if tle_copy(expanded_src, dst):
+        return dst
+
+    # What tle cannot represent (a dtype it has no LM type for, or a layout that
+    # still needs more than MAX_GATHER_RANK dimensions) goes back to PyTorch.
+    return torch.ops.aten.copy_.default.redispatch(
+        _FALLBACK_KEYSET, dst, src, non_blocking
+    )

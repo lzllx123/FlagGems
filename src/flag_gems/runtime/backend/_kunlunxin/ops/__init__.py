@@ -306,6 +306,7 @@ from .trace import trace
 from .tril import tril, tril_, tril_out
 from .triu import triu, triu_
 from .trunc import trunc, trunc_
+from .unfold_copy import unfold_copy
 from .uniform import uniform_
 from .unique import _unique2
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
@@ -754,6 +755,7 @@ __all__ = [
     "trunc",
     "trunc_",
     "true_divide_",
+    "unfold_copy",
     "uniform_",
     "upsample_linear1d",
     "upsample_nearest1d",
